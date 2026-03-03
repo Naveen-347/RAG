@@ -1,214 +1,222 @@
 """
-RAG Application — Vercel Serverless Entry Point
-Lightweight version using TF-IDF embeddings (no PyTorch/ChromaDB).
-Fits within Vercel's 500MB Lambda limit.
+RAG Application — Ultra-lightweight Vercel Serverless Function
+No LangChain (too heavy for serverless). Uses openai SDK directly.
+HTML is served inline to avoid file path issues on Vercel.
 """
 import os
 import uuid
 import tempfile
 from pathlib import Path
 from typing import Optional
+from io import BytesIO
 
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-
-from langchain_openai import ChatOpenAI
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from docx import Document as DocxDocument
+from openai import OpenAI
 
 # ──────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────
 AI_CAFE_API_KEY = os.getenv("AI_CAFE_API_KEY", "")
+AI_CAFE_BASE_URL = (
+    "https://aicafe.hcl.com/AICafeService/api/v1/subscription"
+    "/openai/deployments/gpt-4.1"
+)
 AI_CAFE_API_VERSION = "2024-12-01-preview"
 
-BASE_DIR = Path(__file__).resolve().parent.parent  # project root
-STATIC_DIR = BASE_DIR / "static"
-
 # ──────────────────────────────────────────────
-# LLM
+# OpenAI-compatible client for HCL AI Cafe
 # ──────────────────────────────────────────────
-def get_llm():
-    """Create OpenAI-compatible LLM pointing to HCL AI Cafe."""
-    return ChatOpenAI(
-        model="gpt-4.1",
-        openai_api_key=AI_CAFE_API_KEY,
-        openai_api_base=(
-            "https://aicafe.hcl.com/AICafeService/api/v1/subscription"
-            "/openai/deployments/gpt-4.1"
-        ),
+def get_client():
+    return OpenAI(
+        api_key=AI_CAFE_API_KEY,
+        base_url=AI_CAFE_BASE_URL,
         default_headers={"api-key": AI_CAFE_API_KEY},
         default_query={"api-version": AI_CAFE_API_VERSION},
-        temperature=0.3,
-        max_tokens=1024,
     )
 
 
 # ──────────────────────────────────────────────
-# Lightweight Vector Store (TF-IDF + Cosine Sim)
+# Simple text-based retrieval (no heavy ML libs)
 # ──────────────────────────────────────────────
-class TFIDFVectorStore:
-    """Lightweight vector store using TF-IDF embeddings.
-    No PyTorch, no GPU, no heavy dependencies — perfect for serverless."""
+import re
+from collections import Counter
+import math
+
+
+def tokenize(text: str) -> list[str]:
+    """Simple word tokenizer."""
+    return re.findall(r'\b[a-z0-9]+\b', text.lower())
+
+
+class SimpleRetriever:
+    """BM25-like retriever using pure Python — zero heavy dependencies."""
 
     def __init__(self):
         self.documents: list[str] = []
         self.metadatas: list[dict] = []
-        self.vectorizer = TfidfVectorizer(
-            stop_words="english",
-            max_features=10000,
-            ngram_range=(1, 2),
-        )
-        self.tfidf_matrix = None
+        self.doc_tokens: list[list[str]] = []
+        self.avg_dl: float = 0
+        self.doc_freqs: Counter = Counter()
+        self.n_docs: int = 0
 
     def add_documents(self, texts: list[str], metadatas: list[dict]):
         self.documents = texts
         self.metadatas = metadatas
-        if texts:
-            self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+        self.doc_tokens = [tokenize(t) for t in texts]
+        self.n_docs = len(texts)
+        if self.n_docs > 0:
+            self.avg_dl = sum(len(t) for t in self.doc_tokens) / self.n_docs
+        # Document frequency
+        self.doc_freqs = Counter()
+        for tokens in self.doc_tokens:
+            for token in set(tokens):
+                self.doc_freqs[token] += 1
 
     def search(self, query: str, k: int = 4) -> list[dict]:
-        if not self.documents or self.tfidf_matrix is None:
+        if not self.documents:
             return []
-        query_vec = self.vectorizer.transform([query])
-        similarities = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
-        top_k_indices = similarities.argsort()[-k:][::-1]
 
+        query_tokens = tokenize(query)
+        scores = []
+
+        for i, doc_tokens in enumerate(self.doc_tokens):
+            score = 0.0
+            dl = len(doc_tokens)
+            token_counts = Counter(doc_tokens)
+
+            for qt in query_tokens:
+                if qt not in self.doc_freqs:
+                    continue
+                df = self.doc_freqs[qt]
+                tf = token_counts.get(qt, 0)
+                # BM25 scoring
+                idf = math.log((self.n_docs - df + 0.5) / (df + 0.5) + 1)
+                tf_norm = (tf * 2.5) / (tf + 2.5 * (1 - 0.75 + 0.75 * dl / max(self.avg_dl, 1)))
+                score += idf * tf_norm
+
+            scores.append((i, score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
         results = []
-        for idx in top_k_indices:
-            if similarities[idx] > 0.01:  # minimum relevance threshold
+        for idx, score in scores[:k]:
+            if score > 0:
                 results.append({
                     "content": self.documents[idx],
                     "metadata": self.metadatas[idx],
-                    "score": float(similarities[idx]),
+                    "score": score,
                 })
         return results
+
+
+# ──────────────────────────────────────────────
+# Document parsing (inline, no langchain loaders)
+# ──────────────────────────────────────────────
+
+def extract_text_from_pdf(path: str) -> list[dict]:
+    """Extract text from PDF using pypdf."""
+    from pypdf import PdfReader
+    reader = PdfReader(path)
+    pages = []
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        if text.strip():
+            pages.append({"text": text, "metadata": {"source": path, "page": i + 1}})
+    return pages
+
+
+def extract_text_from_docx(path: str) -> list[dict]:
+    """Extract text from DOCX."""
+    from docx import Document as DocxDocument
+    doc = DocxDocument(path)
+    text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    return [{"text": text, "metadata": {"source": path}}] if text else []
+
+
+def split_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[str]:
+    """Split text into overlapping chunks."""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        if chunk.strip():
+            chunks.append(chunk.strip())
+        start = end - overlap
+    return chunks
 
 
 # ──────────────────────────────────────────────
 # In-memory session store
 # ──────────────────────────────────────────────
 sessions: dict[str, dict] = {}
-vectorstores: dict[str, TFIDFVectorStore] = {}
-
-# ──────────────────────────────────────────────
-# Document helpers
-# ──────────────────────────────────────────────
-
-def extract_text_from_docx(path: str) -> str:
-    """Extract all text from a .docx file."""
-    doc = DocxDocument(path)
-    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+retrievers: dict[str, SimpleRetriever] = {}
 
 
-def process_document(file_path: str, session_id: str, filename: str):
-    """Load document → split → embed with TF-IDF → store in memory."""
+def process_document(file_path: str, session_id: str, filename: str) -> int:
     ext = Path(file_path).suffix.lower()
 
-    # 1. Load text
     if ext == ".pdf":
-        loader = PyPDFLoader(file_path)
-        pages = loader.load()
-        raw_texts = [{"text": p.page_content, "metadata": p.metadata} for p in pages]
+        pages = extract_text_from_pdf(file_path)
     elif ext in (".docx", ".doc"):
-        text = extract_text_from_docx(file_path)
-        raw_texts = [{"text": text, "metadata": {"source": filename}}]
+        pages = extract_text_from_docx(file_path)
     else:
-        raise ValueError(f"Unsupported file type: {ext}")
+        raise ValueError(f"Unsupported: {ext}")
 
-    # 2. Split into chunks
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
+    if not pages:
+        raise ValueError("No text could be extracted.")
 
     all_chunks = []
     all_metas = []
-    for item in raw_texts:
-        chunks = splitter.split_text(item["text"])
+    for page in pages:
+        chunks = split_text(page["text"])
         for chunk in chunks:
-            if chunk.strip():
-                all_chunks.append(chunk)
-                all_metas.append(item["metadata"])
+            all_chunks.append(chunk)
+            all_metas.append(page["metadata"])
 
-    if not all_chunks:
-        raise ValueError("No text could be extracted from the document.")
+    retriever = SimpleRetriever()
+    retriever.add_documents(all_chunks, all_metas)
+    retrievers[session_id] = retriever
 
-    # 3. Store in TF-IDF vector store
-    store = TFIDFVectorStore()
-    store.add_documents(all_chunks, all_metas)
-    vectorstores[session_id] = store
-
-    sessions[session_id] = {
-        "filename": filename,
-        "chunk_count": len(all_chunks),
-    }
-
+    sessions[session_id] = {"filename": filename, "chunk_count": len(all_chunks)}
     return len(all_chunks)
 
 
-# ──────────────────────────────────────────────
-# RAG Chain
-# ──────────────────────────────────────────────
-
-RAG_PROMPT = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""You are a helpful assistant that answers questions based on the provided document context.
-Use ONLY the information from the context below to answer. If the answer is not in the context, say "I couldn't find this information in the uploaded document."
-
-Context:
-{context}
-
-Question: {question}
-
-Answer in a clear, well-structured way. If relevant, quote specific parts of the document.""",
-)
-
-
 def ask_question(session_id: str, question: str) -> dict:
-    """Retrieve relevant chunks via TF-IDF → generate answer with LLM."""
-    store = vectorstores.get(session_id)
-    if store is None:
-        raise ValueError("No document uploaded for this session.")
+    retriever = retrievers.get(session_id)
+    if not retriever:
+        raise ValueError("No document uploaded.")
 
-    # Retrieve top-k relevant chunks
-    results = store.search(question, k=4)
-
+    results = retriever.search(question, k=4)
     if not results:
-        return {
-            "answer": "I couldn't find relevant information in the uploaded document for your question.",
-            "sources": [],
-        }
+        return {"answer": "I couldn't find relevant information in the document.", "sources": []}
 
     context = "\n\n---\n\n".join(r["content"] for r in results)
 
-    # Generate answer
-    llm = get_llm()
-    chain = LLMChain(llm=llm, prompt=RAG_PROMPT)
-    answer = chain.invoke({"context": context, "question": question})
+    client = get_client()
+    response = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[
+            {"role": "system", "content": (
+                "You are a helpful assistant that answers questions based on document context. "
+                "Use ONLY the context provided. If the answer is not in the context, say so."
+            )},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+        ],
+        temperature=0.3,
+        max_tokens=1024,
+    )
 
+    answer = response.choices[0].message.content
     sources = [{"content": r["content"][:300], "metadata": r["metadata"]} for r in results]
-
-    return {
-        "answer": answer["text"],
-        "sources": sources,
-    }
+    return {"answer": answer, "sources": sources}
 
 
 # ──────────────────────────────────────────────
 # FastAPI App
 # ──────────────────────────────────────────────
-
-app = FastAPI(title="RAG Document Q&A", version="1.0.0")
+app = FastAPI(title="RAG Document Q&A")
 
 
 class AskRequest(BaseModel):
@@ -216,75 +224,64 @@ class AskRequest(BaseModel):
     question: str
 
 
-class AskResponse(BaseModel):
-    answer: str
-    sources: list
-
-
-class UploadResponse(BaseModel):
-    session_id: str
-    filename: str
-    chunks: int
-    message: str
-
-
 @app.get("/")
 async def serve_ui():
-    html_path = STATIC_DIR / "index.html"
-    if html_path.exists():
-        return FileResponse(str(html_path))
-    return HTMLResponse("<h1>RAG App</h1><p>static/index.html not found</p>", status_code=500)
+    html_path = Path(__file__).resolve().parent.parent / "static" / "index.html"
+    try:
+        html_content = html_path.read_text(encoding="utf-8")
+        return HTMLResponse(html_content)
+    except FileNotFoundError:
+        return HTMLResponse(FALLBACK_HTML)
 
 
-@app.get("/static/{filepath:path}")
-async def serve_static(filepath: str):
-    file_path = STATIC_DIR / filepath
-    if file_path.exists():
-        return FileResponse(str(file_path))
-    raise HTTPException(404, "File not found")
-
-
-@app.post("/upload", response_model=UploadResponse)
-async def upload_document(file: UploadFile = File(...), session_id: Optional[str] = None):
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...), session_id: Optional[str] = Form(None)):
     if not file.filename:
         raise HTTPException(400, "No file provided.")
     ext = Path(file.filename).suffix.lower()
     if ext not in (".pdf", ".docx", ".doc"):
-        raise HTTPException(400, f"Unsupported file type '{ext}'. Upload a PDF or Word document.")
+        raise HTTPException(400, f"Unsupported file type: {ext}")
 
     sid = session_id or str(uuid.uuid4())
+    save_path = Path(tempfile.gettempdir()) / f"{sid}_{file.filename}"
 
-    tmp_dir = Path(tempfile.gettempdir())
-    save_path = tmp_dir / f"{sid}_{file.filename}"
     with open(save_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+        f.write(await file.read())
 
     try:
         chunk_count = process_document(str(save_path), sid, file.filename)
     except Exception as e:
         save_path.unlink(missing_ok=True)
-        raise HTTPException(500, f"Error processing document: {str(e)}")
+        raise HTTPException(500, f"Error: {str(e)}")
     finally:
         save_path.unlink(missing_ok=True)
 
-    return UploadResponse(
-        session_id=sid,
-        filename=file.filename,
-        chunks=chunk_count,
-        message=f"Successfully processed '{file.filename}' into {chunk_count} chunks.",
-    )
+    return {
+        "session_id": sid,
+        "filename": file.filename,
+        "chunks": chunk_count,
+        "message": f"Processed '{file.filename}' into {chunk_count} chunks.",
+    }
 
 
-@app.post("/ask", response_model=AskResponse)
+@app.post("/ask")
 async def ask(req: AskRequest):
     if not req.question.strip():
         raise HTTPException(400, "Question cannot be empty.")
     if req.session_id not in sessions:
-        raise HTTPException(404, "Session not found. Please upload a document first.")
-
+        raise HTTPException(404, "Session not found. Upload a document first.")
     try:
         result = ask_question(req.session_id, req.question)
-        return AskResponse(**result)
+        return result
     except Exception as e:
-        raise HTTPException(500, f"Error generating answer: {str(e)}")
+        raise HTTPException(500, f"Error: {str(e)}")
+
+
+# ──────────────────────────────────────────────
+# Fallback HTML (if static/index.html not found)
+# ──────────────────────────────────────────────
+FALLBACK_HTML = """<!DOCTYPE html>
+<html><head><title>DocuBot</title>
+<style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#0a0e1a;color:#f1f5f9;}
+.c{text-align:center;} h1{font-size:2em;margin-bottom:10px;} p{color:#94a3b8;}</style>
+</head><body><div class="c"><h1>DocuBot RAG</h1><p>API is running. Static files not found.</p></div></body></html>"""
