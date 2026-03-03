@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RAG Document Q&A</title>
+    <meta name="description" content="Upload PDFs or Word documents and ask questions using AI-powered retrieval-augmented generation." />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <style>
+        /* ── Reset & Base ──────────────────────── */
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg-primary: #0a0e1a;
+            --bg-secondary: #111827;
+            --bg-card: rgba(17, 24, 39, 0.7);
+            --border: rgba(99, 102, 241, 0.2);
+            --border-glow: rgba(99, 102, 241, 0.5);
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent: #6366f1;
+            --accent-light: #818cf8;
+            --accent-glow: rgba(99, 102, 241, 0.3);
+            --success: #10b981;
+            --error: #ef4444;
+            --user-bubble: linear-gradient(135deg, #6366f1, #8b5cf6);
+            --bot-bubble: rgba(30, 41, 59, 0.8);
+            --radius: 16px;
+            --radius-sm: 10px;
+        }
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow: hidden;
+        }
+
+        /* ── Animated Background ───────────────── */
+        .bg-grid {
+            position: fixed; inset: 0; z-index: 0;
+            background-image:
+                radial-gradient(circle at 20% 30%, rgba(99, 102, 241, 0.08) 0%, transparent 50%),
+                radial-gradient(circle at 80% 70%, rgba(139, 92, 246, 0.06) 0%, transparent 50%);
+        }
+        .bg-grid::before {
+            content: '';
+            position: absolute; inset: 0;
+            background-image: linear-gradient(rgba(99, 102, 241, 0.03) 1px, transparent 1px),
+                              linear-gradient(90deg, rgba(99, 102, 241, 0.03) 1px, transparent 1px);
+            background-size: 60px 60px;
+        }
+
+        /* ── Layout ────────────────────────────── */
+        .app {
+            position: relative; z-index: 1;
+            display: grid;
+            grid-template-columns: 380px 1fr;
+            height: 100vh;
+        }
+
+        /* ── Sidebar ───────────────────────────── */
+        .sidebar {
+            background: var(--bg-card);
+            border-right: 1px solid var(--border);
+            backdrop-filter: blur(20px);
+            display: flex; flex-direction: column;
+            padding: 28px 24px;
+            gap: 24px;
+            overflow-y: auto;
+        }
+        .logo {
+            display: flex; align-items: center; gap: 12px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+        .logo-icon {
+            width: 44px; height: 44px;
+            background: var(--user-bubble);
+            border-radius: 12px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 22px;
+            box-shadow: 0 0 24px var(--accent-glow);
+        }
+        .logo h1 {
+            font-size: 20px; font-weight: 700;
+            background: linear-gradient(135deg, var(--text-primary), var(--accent-light));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .logo p {
+            font-size: 12px; color: var(--text-muted); margin-top: 2px;
+        }
+
+        /* ── Upload Zone ───────────────────────── */
+        .upload-section h2 {
+            font-size: 13px; font-weight: 600; color: var(--text-secondary);
+            text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 12px;
+        }
+        .dropzone {
+            border: 2px dashed var(--border);
+            border-radius: var(--radius);
+            padding: 36px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: rgba(99, 102, 241, 0.03);
+            position: relative;
+        }
+        .dropzone:hover, .dropzone.drag-over {
+            border-color: var(--accent);
+            background: rgba(99, 102, 241, 0.08);
+            box-shadow: 0 0 30px var(--accent-glow);
+        }
+        .dropzone-icon {
+            font-size: 40px; margin-bottom: 12px;
+            filter: grayscale(0.3);
+        }
+        .dropzone p { font-size: 14px; color: var(--text-secondary); line-height: 1.6; }
+        .dropzone .hint { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+        .dropzone input { display: none; }
+
+        /* ── Status Card ───────────────────────── */
+        .status-card {
+            display: none;
+            background: rgba(16, 185, 129, 0.08);
+            border: 1px solid rgba(16, 185, 129, 0.25);
+            border-radius: var(--radius-sm);
+            padding: 16px;
+            animation: fadeIn 0.4s ease;
+        }
+        .status-card.visible { display: block; }
+        .status-card.error {
+            background: rgba(239, 68, 68, 0.08);
+            border-color: rgba(239, 68, 68, 0.25);
+        }
+        .status-header {
+            display: flex; align-items: center; gap: 8px;
+            font-size: 14px; font-weight: 600; margin-bottom: 6px;
+        }
+        .status-header .dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--success); display: inline-block;
+            box-shadow: 0 0 8px rgba(16, 185, 129, 0.5);
+        }
+        .status-card.error .dot { background: var(--error); box-shadow: 0 0 8px rgba(239, 68, 68, 0.5); }
+        .status-detail { font-size: 12px; color: var(--text-muted); }
+
+        /* ── Loading Spinner ───────────────────── */
+        .spinner {
+            display: none;
+            margin: 16px auto;
+            width: 36px; height: 36px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        .spinner.visible { display: block; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ── Chat Area ─────────────────────────── */
+        .chat-area {
+            display: flex; flex-direction: column;
+            height: 100vh;
+        }
+        .chat-header {
+            padding: 20px 32px;
+            border-bottom: 1px solid var(--border);
+            backdrop-filter: blur(12px);
+            background: rgba(10, 14, 26, 0.6);
+        }
+        .chat-header h2 { font-size: 18px; font-weight: 600; }
+        .chat-header p { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+
+        .messages {
+            flex: 1; overflow-y: auto;
+            padding: 28px 32px;
+            display: flex; flex-direction: column; gap: 20px;
+            scroll-behavior: smooth;
+        }
+        .messages::-webkit-scrollbar { width: 6px; }
+        .messages::-webkit-scrollbar-track { background: transparent; }
+        .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+        /* ── Chat Bubbles ──────────────────────── */
+        .message {
+            max-width: 75%;
+            animation: slideUp 0.35s ease;
+        }
+        .message.user { align-self: flex-end; }
+        .message.bot  { align-self: flex-start; }
+
+        .message .bubble {
+            padding: 14px 18px;
+            border-radius: var(--radius);
+            font-size: 14px; line-height: 1.7;
+            word-wrap: break-word;
+        }
+        .message.user .bubble {
+            background: var(--user-bubble);
+            border-bottom-right-radius: 4px;
+            color: white;
+        }
+        .message.bot .bubble {
+            background: var(--bot-bubble);
+            border: 1px solid var(--border);
+            border-bottom-left-radius: 4px;
+            backdrop-filter: blur(10px);
+        }
+        .message .label {
+            font-size: 11px; color: var(--text-muted);
+            margin-bottom: 6px; font-weight: 500;
+        }
+        .message.user .label { text-align: right; }
+
+        /* ── Sources Accordion ─────────────────── */
+        .sources-toggle {
+            margin-top: 10px; font-size: 12px;
+            color: var(--accent-light); cursor: pointer;
+            display: flex; align-items: center; gap: 4px;
+            font-weight: 500;
+        }
+        .sources-toggle:hover { text-decoration: underline; }
+        .sources-list {
+            display: none; margin-top: 8px;
+            border-top: 1px solid var(--border);
+            padding-top: 8px;
+        }
+        .sources-list.open { display: block; }
+        .source-item {
+            font-size: 12px; color: var(--text-muted);
+            background: rgba(99, 102, 241, 0.05);
+            border-radius: 8px; padding: 10px 12px;
+            margin-bottom: 6px; line-height: 1.5;
+            border-left: 3px solid var(--accent);
+        }
+
+        /* ── Typing indicator ──────────────────── */
+        .typing-indicator {
+            display: none; align-self: flex-start;
+            padding: 14px 18px;
+            background: var(--bot-bubble);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            border-bottom-left-radius: 4px;
+            backdrop-filter: blur(10px);
+        }
+        .typing-indicator.visible { display: flex; gap: 5px; align-items: center; }
+        .typing-indicator span {
+            width: 7px; height: 7px;
+            background: var(--text-muted);
+            border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out;
+        }
+        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+            40% { transform: scale(1); opacity: 1; }
+        }
+
+        /* ── Input Bar ─────────────────────────── */
+        .input-bar {
+            padding: 20px 32px;
+            border-top: 1px solid var(--border);
+            background: rgba(10, 14, 26, 0.6);
+            backdrop-filter: blur(12px);
+        }
+        .input-wrapper {
+            display: flex; gap: 12px;
+            max-width: 100%;
+        }
+        .input-wrapper input {
+            flex: 1;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 14px 18px;
+            color: var(--text-primary);
+            font-family: inherit; font-size: 14px;
+            outline: none;
+            transition: border-color 0.3s, box-shadow 0.3s;
+        }
+        .input-wrapper input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 20px var(--accent-glow);
+        }
+        .input-wrapper input::placeholder { color: var(--text-muted); }
+        .input-wrapper input:disabled {
+            opacity: 0.4; cursor: not-allowed;
+        }
+        .send-btn {
+            width: 50px; height: 50px;
+            border-radius: 12px;
+            background: var(--user-bubble);
+            border: none; cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 20px; color: white;
+            transition: transform 0.2s, box-shadow 0.3s;
+            box-shadow: 0 0 20px var(--accent-glow);
+            flex-shrink: 0;
+        }
+        .send-btn:hover { transform: scale(1.05); box-shadow: 0 0 30px var(--accent-glow); }
+        .send-btn:active { transform: scale(0.95); }
+        .send-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+        /* ── Welcome Message ───────────────────── */
+        .welcome {
+            flex: 1; display: flex;
+            flex-direction: column; align-items: center; justify-content: center;
+            text-align: center; padding: 40px;
+        }
+        .welcome-icon {
+            font-size: 64px; margin-bottom: 20px;
+            filter: drop-shadow(0 0 20px var(--accent-glow));
+        }
+        .welcome h3 {
+            font-size: 22px; font-weight: 600; margin-bottom: 10px;
+        }
+        .welcome p {
+            font-size: 14px; color: var(--text-muted); max-width: 380px; line-height: 1.7;
+        }
+
+        /* ── Animations ────────────────────────── */
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+
+        /* ── Responsive ────────────────────────── */
+        @media (max-width: 768px) {
+            .app {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto 1fr;
+            }
+            .sidebar {
+                border-right: none;
+                border-bottom: 1px solid var(--border);
+                max-height: 280px;
+                padding: 16px;
+            }
+            .messages { padding: 16px; }
+            .input-bar { padding: 12px 16px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-grid"></div>
+
+    <div class="app">
+        <!-- ── Sidebar ──────────────────────── -->
+        <aside class="sidebar">
+            <div class="logo">
+                <div class="logo-icon">📄</div>
+                <div>
+                    <h1>DocuBot</h1>
+                    <p>AI-Powered Document Q&A</p>
+                </div>
+            </div>
+
+            <div class="upload-section">
+                <h2>Upload Document</h2>
+                <div class="dropzone" id="dropzone">
+                    <div class="dropzone-icon">📁</div>
+                    <p>Drag & drop your file here</p>
+                    <p class="hint">or click to browse — PDF, DOCX</p>
+                    <input type="file" id="fileInput" accept=".pdf,.doc,.docx" />
+                </div>
+                <div class="spinner" id="uploadSpinner"></div>
+            </div>
+
+            <div class="status-card" id="statusCard">
+                <div class="status-header">
+                    <span class="dot"></span>
+                    <span id="statusTitle">Document Ready</span>
+                </div>
+                <div class="status-detail" id="statusDetail"></div>
+            </div>
+        </aside>
+
+        <!-- ── Chat ─────────────────────────── -->
+        <main class="chat-area">
+            <div class="chat-header">
+                <h2>💬 Chat with your Document</h2>
+                <p>Ask any question about the uploaded document</p>
+            </div>
+
+            <div class="messages" id="messages">
+                <div class="welcome" id="welcome">
+                    <div class="welcome-icon">🤖</div>
+                    <h3>Welcome to DocuBot</h3>
+                    <p>Upload a PDF or Word document using the panel on the left, then ask any question about its contents. I'll find the answer for you!</p>
+                </div>
+            </div>
+
+            <div class="typing-indicator" id="typingIndicator">
+                <span></span><span></span><span></span>
+            </div>
+
+            <div class="input-bar">
+                <div class="input-wrapper">
+                    <input
+                        type="text"
+                        id="questionInput"
+                        placeholder="Ask a question about your document..."
+                        disabled
+                        autocomplete="off"
+                    />
+                    <button class="send-btn" id="sendBtn" disabled title="Send">
+                        ➤
+                    </button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // ── State ─────────────────────────────────
+        let sessionId = null;
+
+        // ── DOM ───────────────────────────────────
+        const dropzone      = document.getElementById('dropzone');
+        const fileInput      = document.getElementById('fileInput');
+        const uploadSpinner  = document.getElementById('uploadSpinner');
+        const statusCard     = document.getElementById('statusCard');
+        const statusTitle    = document.getElementById('statusTitle');
+        const statusDetail   = document.getElementById('statusDetail');
+        const messagesEl     = document.getElementById('messages');
+        const welcome        = document.getElementById('welcome');
+        const questionInput  = document.getElementById('questionInput');
+        const sendBtn        = document.getElementById('sendBtn');
+        const typingIndicator = document.getElementById('typingIndicator');
+
+        // ── Upload handlers ───────────────────────
+        dropzone.addEventListener('click', () => fileInput.click());
+        dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over'); });
+        dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
+        dropzone.addEventListener('drop', e => {
+            e.preventDefault();
+            dropzone.classList.remove('drag-over');
+            if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
+        });
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length) uploadFile(fileInput.files[0]);
+        });
+
+        async function uploadFile(file) {
+            const ext = file.name.split('.').pop().toLowerCase();
+            if (!['pdf', 'doc', 'docx'].includes(ext)) {
+                showStatus('Unsupported File', `"${file.name}" is not a PDF or Word document.`, true);
+                return;
+            }
+
+            uploadSpinner.classList.add('visible');
+            statusCard.classList.remove('visible');
+
+            const formData = new FormData();
+            formData.append('file', file);
+            if (sessionId) formData.append('session_id', sessionId);
+
+            try {
+                const res = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await res.json();
+
+                if (!res.ok) throw new Error(data.detail || 'Upload failed');
+
+                sessionId = data.session_id;
+                showStatus('Document Ready', `${data.filename} — ${data.chunks} chunks indexed`, false);
+                questionInput.disabled = false;
+                sendBtn.disabled = false;
+                questionInput.focus();
+            } catch (err) {
+                showStatus('Upload Failed', err.message, true);
+            } finally {
+                uploadSpinner.classList.remove('visible');
+                fileInput.value = '';
+            }
+        }
+
+        function showStatus(title, detail, isError) {
+            statusTitle.textContent = title;
+            statusDetail.textContent = detail;
+            statusCard.classList.toggle('error', isError);
+            statusCard.classList.add('visible');
+        }
+
+        // ── Chat handlers ─────────────────────────
+        questionInput.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendQuestion();
+            }
+        });
+        sendBtn.addEventListener('click', sendQuestion);
+
+        async function sendQuestion() {
+            const q = questionInput.value.trim();
+            if (!q || !sessionId) return;
+
+            // Hide welcome
+            welcome.style.display = 'none';
+
+            // Add user bubble
+            addMessage(q, 'user');
+            questionInput.value = '';
+            questionInput.disabled = true;
+            sendBtn.disabled = true;
+            typingIndicator.classList.add('visible');
+            scrollToBottom();
+
+            try {
+                const res = await fetch('/ask', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId, question: q }),
+                });
+                const data = await res.json();
+
+                if (!res.ok) throw new Error(data.detail || 'Failed to get answer');
+
+                addMessage(data.answer, 'bot', data.sources);
+            } catch (err) {
+                addMessage(`⚠️ Error: ${err.message}`, 'bot');
+            } finally {
+                typingIndicator.classList.remove('visible');
+                questionInput.disabled = false;
+                sendBtn.disabled = false;
+                questionInput.focus();
+                scrollToBottom();
+            }
+        }
+
+        function addMessage(text, role, sources) {
+            const msg = document.createElement('div');
+            msg.className = `message ${role}`;
+
+            const label = document.createElement('div');
+            label.className = 'label';
+            label.textContent = role === 'user' ? 'You' : 'DocuBot';
+
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.textContent = text;
+
+            msg.appendChild(label);
+            msg.appendChild(bubble);
+
+            // Sources accordion
+            if (sources && sources.length) {
+                const toggle = document.createElement('div');
+                toggle.className = 'sources-toggle';
+                toggle.innerHTML = '📎 View Sources (' + sources.length + ')';
+
+                const list = document.createElement('div');
+                list.className = 'sources-list';
+                sources.forEach(s => {
+                    const item = document.createElement('div');
+                    item.className = 'source-item';
+                    item.textContent = s.content;
+                    list.appendChild(item);
+                });
+
+                toggle.addEventListener('click', () => list.classList.toggle('open'));
+                msg.appendChild(toggle);
+                msg.appendChild(list);
+            }
+
+            messagesEl.appendChild(msg);
+            scrollToBottom();
+        }
+
+        function scrollToBottom() {
+            requestAnimationFrame(() => {
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+            });
+        }
+    </script>
+</body>
+</html>
