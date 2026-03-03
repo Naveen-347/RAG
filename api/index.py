@@ -1,7 +1,7 @@
 """
 RAG Application — Vercel Serverless Entry Point
-FastAPI app adapted for Vercel's stateless Python runtime.
-Uses in-memory ChromaDB (no persistent filesystem on Vercel).
+Lightweight version using TF-IDF embeddings (no PyTorch/ChromaDB).
+Fits within Vercel's 500MB Lambda limit.
 """
 import os
 import uuid
@@ -9,18 +9,19 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 from langchain_openai import ChatOpenAI
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
 from docx import Document as DocxDocument
 
 # ──────────────────────────────────────────────
@@ -33,7 +34,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # project root
 STATIC_DIR = BASE_DIR / "static"
 
 # ──────────────────────────────────────────────
-# LLM & Embeddings
+# LLM
 # ──────────────────────────────────────────────
 def get_llm():
     """Create OpenAI-compatible LLM pointing to HCL AI Cafe."""
@@ -51,18 +52,52 @@ def get_llm():
     )
 
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"},
-)
+# ──────────────────────────────────────────────
+# Lightweight Vector Store (TF-IDF + Cosine Sim)
+# ──────────────────────────────────────────────
+class TFIDFVectorStore:
+    """Lightweight vector store using TF-IDF embeddings.
+    No PyTorch, no GPU, no heavy dependencies — perfect for serverless."""
+
+    def __init__(self):
+        self.documents: list[str] = []
+        self.metadatas: list[dict] = []
+        self.vectorizer = TfidfVectorizer(
+            stop_words="english",
+            max_features=10000,
+            ngram_range=(1, 2),
+        )
+        self.tfidf_matrix = None
+
+    def add_documents(self, texts: list[str], metadatas: list[dict]):
+        self.documents = texts
+        self.metadatas = metadatas
+        if texts:
+            self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+
+    def search(self, query: str, k: int = 4) -> list[dict]:
+        if not self.documents or self.tfidf_matrix is None:
+            return []
+        query_vec = self.vectorizer.transform([query])
+        similarities = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
+        top_k_indices = similarities.argsort()[-k:][::-1]
+
+        results = []
+        for idx in top_k_indices:
+            if similarities[idx] > 0.01:  # minimum relevance threshold
+                results.append({
+                    "content": self.documents[idx],
+                    "metadata": self.metadatas[idx],
+                    "score": float(similarities[idx]),
+                })
+        return results
+
 
 # ──────────────────────────────────────────────
 # In-memory session store
-# NOTE: Vercel functions are stateless — each invocation may lose state.
-#       For production, use a cloud vector DB (Pinecone, Chroma Cloud, etc.)
 # ──────────────────────────────────────────────
 sessions: dict[str, dict] = {}
-vectorstores: dict[str, Chroma] = {}
+vectorstores: dict[str, TFIDFVectorStore] = {}
 
 # ──────────────────────────────────────────────
 # Document helpers
@@ -75,18 +110,17 @@ def extract_text_from_docx(path: str) -> str:
 
 
 def process_document(file_path: str, session_id: str, filename: str):
-    """Load document → split → embed → store in in-memory ChromaDB."""
+    """Load document → split → embed with TF-IDF → store in memory."""
     ext = Path(file_path).suffix.lower()
 
     # 1. Load text
     if ext == ".pdf":
         loader = PyPDFLoader(file_path)
         pages = loader.load()
-        raw_texts = pages
+        raw_texts = [{"text": p.page_content, "metadata": p.metadata} for p in pages]
     elif ext in (".docx", ".doc"):
         text = extract_text_from_docx(file_path)
-        from langchain.schema import Document as LCDoc
-        raw_texts = [LCDoc(page_content=text, metadata={"source": filename})]
+        raw_texts = [{"text": text, "metadata": {"source": filename}}]
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
@@ -96,27 +130,30 @@ def process_document(file_path: str, session_id: str, filename: str):
         chunk_overlap=200,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
-    chunks = splitter.split_documents(raw_texts)
 
-    if not chunks:
+    all_chunks = []
+    all_metas = []
+    for item in raw_texts:
+        chunks = splitter.split_text(item["text"])
+        for chunk in chunks:
+            if chunk.strip():
+                all_chunks.append(chunk)
+                all_metas.append(item["metadata"])
+
+    if not all_chunks:
         raise ValueError("No text could be extracted from the document.")
 
-    # 3. Store in in-memory ChromaDB
-    collection_name = f"session_{session_id.replace('-', '_')}"
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name=collection_name,
-    )
+    # 3. Store in TF-IDF vector store
+    store = TFIDFVectorStore()
+    store.add_documents(all_chunks, all_metas)
+    vectorstores[session_id] = store
 
-    vectorstores[session_id] = vectorstore
     sessions[session_id] = {
-        "collection": collection_name,
         "filename": filename,
-        "chunk_count": len(chunks),
+        "chunk_count": len(all_chunks),
     }
 
-    return len(chunks)
+    return len(all_chunks)
 
 
 # ──────────────────────────────────────────────
@@ -138,32 +175,31 @@ Answer in a clear, well-structured way. If relevant, quote specific parts of the
 
 
 def ask_question(session_id: str, question: str) -> dict:
-    """Run RAG: retrieve relevant chunks → generate answer."""
-    vectorstore = vectorstores.get(session_id)
-    if vectorstore is None:
+    """Retrieve relevant chunks via TF-IDF → generate answer with LLM."""
+    store = vectorstores.get(session_id)
+    if store is None:
         raise ValueError("No document uploaded for this session.")
 
+    # Retrieve top-k relevant chunks
+    results = store.search(question, k=4)
+
+    if not results:
+        return {
+            "answer": "I couldn't find relevant information in the uploaded document for your question.",
+            "sources": [],
+        }
+
+    context = "\n\n---\n\n".join(r["content"] for r in results)
+
+    # Generate answer
     llm = get_llm()
+    chain = LLMChain(llm=llm, prompt=RAG_PROMPT)
+    answer = chain.invoke({"context": context, "question": question})
 
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": RAG_PROMPT},
-    )
-
-    result = qa_chain.invoke({"query": question})
-
-    sources = []
-    for doc in result.get("source_documents", []):
-        sources.append({
-            "content": doc.page_content[:300],
-            "metadata": doc.metadata,
-        })
+    sources = [{"content": r["content"][:300], "metadata": r["metadata"]} for r in results]
 
     return {
-        "answer": result["result"],
+        "answer": answer["text"],
         "sources": sources,
     }
 
@@ -194,7 +230,10 @@ class UploadResponse(BaseModel):
 
 @app.get("/")
 async def serve_ui():
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    html_path = STATIC_DIR / "index.html"
+    if html_path.exists():
+        return FileResponse(str(html_path))
+    return HTMLResponse("<h1>RAG App</h1><p>static/index.html not found</p>", status_code=500)
 
 
 @app.get("/static/{filepath:path}")
@@ -207,17 +246,14 @@ async def serve_static(filepath: str):
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(file: UploadFile = File(...), session_id: Optional[str] = None):
-    # Validate file type
     if not file.filename:
         raise HTTPException(400, "No file provided.")
     ext = Path(file.filename).suffix.lower()
     if ext not in (".pdf", ".docx", ".doc"):
         raise HTTPException(400, f"Unsupported file type '{ext}'. Upload a PDF or Word document.")
 
-    # Create or reuse session
     sid = session_id or str(uuid.uuid4())
 
-    # Save file to temp directory (Vercel allows /tmp)
     tmp_dir = Path(tempfile.gettempdir())
     save_path = tmp_dir / f"{sid}_{file.filename}"
     with open(save_path, "wb") as f:
