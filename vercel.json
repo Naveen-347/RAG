@@ -1,11 +1,9 @@
 {
-    "builds": [
-        {
-            "src": "api/index.py",
-            "use": "@vercel/python"
-        }
-    ],
     "rewrites": [
+        {
+            "source": "/api/(.*)",
+            "destination": "/api/index"
+        },
         {
             "source": "/(.*)",
             "destination": "/api/index"
